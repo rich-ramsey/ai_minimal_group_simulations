@@ -1,0 +1,1875 @@
+---
+title: "sims"
+author: "Rich"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This files runs simulations for the AI minimal group exps based on the
+general workings in this folder: /exps/R/simulations/brms/planning/, as well as
+here: /exps/eliane/congruency/paintings/simulation_ml/
+
+The basic workflow is as follows:
+1. Simulate one dataset.
+2. Build one model in brms with justifiable priors set.
+3. Create a function to loop through 1:n_sims and each time update the model
+created in step (2) using the brms function 'update'. This saves time compiling
+the model each time, which is important if we are going to build 500/1000 sims.
+Note: the brms::update function is only available for simpler models, AFIK.
+
+4. Then look at widths instead of "power". 
+
+## install packages ##
+
+```{r install-pkg}
+# install.packages("remotes")
+# remotes::install_github("stan-dev/cmdstanr")
+# install.packages(c("brms", "tidyverse", "future", "faux")) # parallel comes pre-installed, hence it only needs loading in the next chunk and not installing.
+# 
+# # this helps to visualise priors
+# install.packages("devtools")
+# devtools::install_github("jmgirard/standist")
+```
+
+## load ##
+
+```{r load-pkg}
+pkg <- c("cmdstanr", "brms", "tidyverse", "future", "parallel", "faux", "standist")
+
+lapply(pkg, library, character.only = TRUE)
+```
+
+## settings ##
+
+```{r set-options}
+options(brms.backend = "cmdstanr",
+        mc.cores = parallel::detectCores(),
+        future.fork.enable = TRUE,
+        future.rng.onMisuse = "ignore") ## automatically set in RStudio
+
+supportsMulticore()
+
+detectCores()
+```
+
+## snapshot ##
+
+```{r snapshot-renv}
+# take a snapshot and update the lock.file
+# renv::snapshot() # this is only necessary when new packages or installed or packages are updated.
+```
+
+## 1) create some initial data ##
+
+create the data
+
+I need to work on the data structure here and think about all the parameters in 
+the model.
+
+use sim design to get an idea of a design that does not have mixed-effects.
+
+```{r}
+# d_sim_design <- sim_design(
+#   n = 250,
+#   between = list(agent = c("human", "AI")),
+#   within = list(time = c("mat1", "mat2", "mat3")),
+#   mu = data.frame(
+#     human = c(4, 2, 4),
+#     AI = c(5, 3, 5),
+#     row.names = c("mat1", "mat2", "mat3")),
+#   r = list(human = 0.5,
+#            AI = 0.5)
+# )
+# 
+# get_params(d_sim_design)
+```
+
+This gives a general sense of a 2 (between-group) * 3 (within-group) design, with
+N=250 per group and means set to the past work we've done, but with AI + 1 point.
+
+ok, but what about a design with mixed effects?
+
+start small and follow the faux website. 
+https://debruine.github.io/data-sim-workshops/articles/mixed.html 
+
+
+but now look at a multi-level design
+
+```{r}
+# subj_n = 500  # number of subjects
+# # item_n = 6  # number of items # remove this as we don't have meaningful item variation
+# u0s_sd = 0.5  # random intercept SD for subjects
+# # u1s_sd = 1  # random b1 slope SD for subjects (effect of mat2v1)
+# 
+# b0 = 3      # intercept
+# b1 = -2   # fixed effect of matrix type m2v1
+# b2 = 0      # fixed effect of matrix type m3v1
+# b3 = 1    # fixed effect of agent
+# 
+# sigma_sd = 2 # error SD
+# 
+# d <- add_random(subj = subj_n) %>%
+#   add_between(.by = "subj", 
+#               agent = c("human", "AI")) %>%
+#   add_contrast("agent", "anova", add_cols = TRUE, colnames = "agentd") %>%
+#   add_within(matrix_type = c("mat1", "mat2", "mat3")) %>% 
+#   add_contrast("matrix_type", "anova", add_cols = TRUE, 
+#                colnames = c("mat2v1", "mat3v1")) %>%
+#   add_ranef("subj", u0s = u0s_sd) %>%
+#   add_ranef(sigma = sigma_sd) %>%
+#   # calculate DV
+#   mutate(y = b0 + u0s + b1 * mat2v1 + b2 * mat3v1 + b3 * agentd + sigma)
+  
+```
+
+plot
+
+```{r}
+ggplot(d, aes(matrix_type, y, color = agent)) +
+  geom_hline(yintercept = b0) +
+  geom_hline(yintercept = 0, colour = "RED") +
+  geom_violin(alpha = 0.5) +
+  stat_summary(fun = mean,
+               fun.min = \(x){mean(x) - sd(x)},
+               fun.max = \(x){mean(x) + sd(x)},
+               position = position_dodge(width = 0.9)) +
+  scale_color_brewer(palette = "Dark2") 
+```
+
+ok, so we have something sensible now in original units...
+
+
+let's add some more varying effects. (skip the interaction, see text below).
+
+We don't actually expect an interaction, so I guess that analysis could be 
+exploratory. e.g., we will run it and if it is clear and obvious it will affect 
+how we interpret our avg. effects. But if it is small (close to zero), we will 
+interpret the avg effects, which we have simulated.
+
+```{r}
+subj_n = 500  # number of subjects
+# item_n = 6  # number of items # remove this as we don't have meaningful item variation
+u0s_sd = 0.5  # random intercept SD for subjects
+u1s_sd = 1  # random b1 slope SD for subjects (effect of mat2v1)
+u2s_sd = 1  # random b2 slope SD for subjects (effect of mat3v1)
+r01s = -0.5   # correlation between random effects 0 and 1 for subjects
+r02s = 0.3   # correlation between random effects 0 and 2 for subjects
+r12s = -0.3   # correlation between random effects 1 and 2 for subjects
+
+b0 = 3      # intercept
+b1 = -2   # fixed effect of matrix type m2v1
+b2 = 0      # fixed effect of matrix type m3v1
+b3 = 1    # fixed effect of agent
+
+sigma_sd = 2 # error SD
+
+d2 <- add_random(subj = subj_n) %>%
+  add_between(.by = "subj", 
+              agent = c("human", "AI")) %>%
+  add_contrast("agent", "anova", add_cols = TRUE, colnames = "agentd") %>%
+  add_within(matrix_type = c("mat1", "mat2", "mat3")) %>% 
+  add_contrast("matrix_type", "anova", add_cols = TRUE, 
+               colnames = c("mat2v1", "mat3v1")) %>%
+  add_ranef("subj", u0s = u0s_sd, u1s = u1s_sd, u2s = u2s_sd, 
+            .cors = c(r01s, r02s, r12s)) %>%
+  add_ranef(sigma = sigma_sd) %>%
+  # calculate DV
+  mutate(y = b0 + u0s + (b1 + u1s) * mat2v1 + (b2 + u2s) * mat3v1 
+         + b3 * agentd + sigma)
+head(d2)
+```
+
+plot
+
+```{r}
+ggplot(d2, aes(matrix_type, y, color = agent)) +
+  geom_hline(yintercept = b0) +
+  geom_hline(yintercept = 0, colour = "RED") +
+  geom_violin(alpha = 0.5) +
+  stat_summary(fun = mean,
+               fun.min = \(x){mean(x) - sd(x)/sqrt(250)},
+               fun.max = \(x){mean(x) + sd(x)/sqrt(250)},
+               position = position_dodge(width = 0.9)) +
+  scale_color_brewer(palette = "Dark2")
+```
+
+```{r}
+ggplot(d2, aes(x=y, fill=agent)) +
+   geom_density(alpha = 0.3, colour = "darkgrey") +
+   scale_fill_brewer(palette = "Dark2")+
+   theme_bw()+
+   theme(panel.grid = element_blank()) +
+   theme(legend.position = "none") +
+   ggtitle("response by condition") +
+   facet_wrap(~matrix_type, ncol = 1)
+```
+
+ok, so this looks good so far. we would obviously vary the effect size of 
+agent in a sim, as well as vary the sample size.
+
+
+maybe take a look at past data or models to get a sense of SDs and cors in 
+similar data.
+
+## 2) take a look at past data and models ##
+
+this is a slight departure from previous sim that this sim is based upon because
+here we have very relavant past data, which can be used to guide SDs and cors.
+
+## past data ##
+
+and maybe consider estimating within condition correlations from past exps and/or
+SDs from past exps. To do so, load prior data and take a look.
+
+load prior data
+
+```{r}
+
+```
+
+## or load the prior models?? ##
+
+dots minimal group stuff
+
+```{r}
+bi2 <- readRDS("models/bi2.rds")
+bd5.1 <- readRDS("models/bd5.1.rds")
+```
+
+
+```{r}
+summary(bd5.1)
+```
+
+## 3) prior formulas ##
+
+And keep in mind the brms formulas we are working towards e.g., 
+
+index coding, where condition is the 2 group by 3 matrix type and pull = 
+the calculated pull or diff score (avg of 2 versions, normal and flipped.)
+
+```{r}
+formula = bf(pull ~ 0 + condition +
+             (0 + condition | pid))
+
+# is this ok when agent is between groups?? i.e., ok to ignore it and treat them
+# independently? I guess so because that's what we want e.g., independent estimates
+# compared to a reference category.
+```
+
+and the factorial version, 2x3 version.
+
+```{r}
+formula = bf(pull ~ 1 + agent * mat1 + agent * mat2 + agent * mat3 +
+             (1 + mat1 + mat2 + mat3 | pid))
+
+# agent is between groups, so no varying effects there by pid.
+# not sure we need mat1 - 3, rather than just 1 and 2, to reflect anova coding of
+# 3 levels
+```
+
+
+## 4) mean centre and standardise the dv ?? ##
+
+```{r}
+d2 <- d2 %>%
+  mutate(y_c = y - mean(y),
+         y_cs = (y - (mean(y))) / sd(y))
+head(d2)
+```
+
+
+adding these to the original data is fine and good. But it does get confusing 
+below if we set b0 and b1 etc. in original units but then later in the code 
+standardise and centre. Probably better to just create the DV in centred and 
+standardised units with b0 = 0 and effects in SDs. That way, we can then vary 
+the effect size in the sims e.g., 0.25, .5, 0.75 or more likely in this example
+the effect of agent is likely smaller. So maybe 0.2, 0.3, 0.4??
+
+
+## 5) fit an initial model ##
+
+this is with the DV in original units.
+
+run a model on data d2
+
+2x3 factorial design
+
+formula
+
+```{r}
+formula = bf(y ~ 1 + agentd * mat2v1 + agentd * mat3v1 +
+               (1 + mat2v1 + mat3v1 | subj))
+```
+
+check priors
+
+```{r}
+get_prior(data = d2,
+          family = gaussian,
+          formula)
+```
+
+visualise prior settings
+
+```{r}
+visualize("normal(0, 0.5)", "normal(0, 1)", "normal(0, 2)", 
+          xlim = c(-4, 4))
+```
+
+set priors
+
+```{r}
+priors <- c(
+  set_prior("normal(0, 1)", class = "Intercept"),
+  set_prior("normal(0, 0.5)", class = "b"),
+  set_prior("normal(0, 0.5)", class = "sigma"),
+  set_prior('normal(0, 0.5)', class = 'sd'),
+  set_prior("lkj(2)", class = "cor") # correlation between varying effects log-units
+)
+```
+
+fit the model - in original units
+
+```{r}
+fit <-
+  brm(data = d2,
+      family = gaussian,
+      formula = formula,
+      prior = priors,
+      seed = 1)
+```
+
+let's take a look 
+
+```{r}
+# chains
+plot(fit)
+# summary
+print(fit)
+# fixed effects
+fixef(fit)
+
+# save initial fit
+saveRDS(fit, "models/fit.rds")
+```
+
+## now fit an initial model with the DV in standardised units ##
+
+2x3 factorial design
+
+same formula and priors, just different DV.
+
+and change some settings to make the model run better.
+
+formula
+
+```{r}
+formula = bf(y_cs ~ 1 + agentd * mat2v1 + agentd * mat3v1 +
+               (1 + mat2v1 + mat3v1 | subj))
+```
+
+set priors
+
+```{r}
+priors <- c(
+  set_prior("normal(0, 1)", class = "Intercept"),
+  set_prior("normal(0, 0.5)", class = "b"),
+  set_prior("normal(0, 0.5)", class = "sigma"),
+  set_prior('normal(0, 0.5)', class = 'sd'),
+  set_prior("lkj(2)", class = "cor") # correlation between varying effects log-units
+)
+```
+
+build the model
+
+```{r}
+plan(multicore)
+fit_cs <-
+  brm(data = d2,
+      family = gaussian,
+      formula = formula,
+      prior = priors,
+      cores = 8, 
+      control = list(adapt_delta = 0.95),
+      save_pars = save_pars(all=TRUE),
+      seed = 1)
+```
+
+let's take a look 
+
+```{r}
+# chains
+plot(fit_cs)
+# summary
+print(fit_cs)
+# fixed effects
+fixef(fit_cs)
+
+# save initial fit
+saveRDS(fit, "models/fit_cs.rds")
+```
+
+## 6) update the fit ##
+
+update the fit and check the time taken (this is unnecessary, but just to see 
+the time difference, which is usually quite large)
+
+```{r}
+# set.seed(2)
+# # 
+# d3 <- add_random(subj = subj_n) %>%
+#   add_between(.by = "subj", 
+#               agent = c("human", "AI")) %>%
+#   add_contrast("agent", "anova", add_cols = TRUE, colnames = "agentd") %>%
+#   add_within(matrix_type = c("mat1", "mat2", "mat3")) %>% 
+#   add_contrast("matrix_type", "anova", add_cols = TRUE, 
+#                colnames = c("mat2v1", "mat3v1")) %>%
+#   add_ranef("subj", u0s = u0s_sd, u1s = u1s_sd, u2s = u2s_sd, 
+#             .cors = c(r01s, r02s, r12s)) %>%
+#   add_ranef(sigma = sigma_sd) %>%
+#   # calculate DV
+#   mutate(y = b0 + u0s + (b1 + u1s) * mat2v1 + (b2 + u2s) * mat3v1 
+#          + b3 * agentd + sigma) %>% 
+#   mutate(y_c = y - mean(y),
+#          y_cs = (y - (mean(y))) / sd(y))
+# head(d3)
+# # 
+# t1 <- Sys.time()
+# 
+# updated_fit_cs <-
+#   update(fit_cs,
+#          newdata = d3,
+#          seed = 2)
+# 
+# t2 <- Sys.time()
+# 
+# t2 - t1
+# 
+# # Time difference of 35.03193 secs
+```
+
+## 7) now create data and build a model with the DV in standardised units ##
+
+I feel like this is a subtle but important difference. If we create data with 
+b0 = 3 and b1 = 1 etc. then these are in points on a scale. 
+
+But we really want the DV and the effects in a standardised and centered metric,
+at least for model building. And then we can convert back into original units for
+understanding and interpretation.
+
+The reason is that when we don't know much about a metric, then it is useful to
+simulate on past knowledge, such as the effects of AI vs human agent are expected 
+to be small (but we don't know what small looks like on a weird Tajfel matrices
+scale). However, we do know what a small standardised effect in psychology would 
+look like. I'm not using these small labels in any concrete way, I simply mean
+numberically small standardised effect e.g., 0.2/0.3 etc.
+
+## first, re-run a past model from the minimal group dots exp ##
+
+where the dv is centred and standardised. I think the original model was done 
+in original units. This is helpful to set the SDs and cors.
+
+load the data and create the new variable
+
+```{r}
+data_diffd <- read_csv("data/data_diffd.csv") %>% 
+  mutate(pull_c = pull - mean(pull),
+         pull_cs = (pull - (mean(pull))) / sd(pull))
+head(data_diffd)
+```
+
+# three interaction model #
+
+# bd5.1 - task*mat1 + task*mat2 + task*mat3 #
+
+# formula #
+
+I think there is no need for 3 mats for the anova. I think 2 will do it. But 
+I'll keep 3 because that's how we setup the past exp.
+
+```{r}
+formula = bf(pull_cs ~ 1 + task * mat1 + task * mat2 + task * mat3 +
+             (1 + task * mat1 + task * mat2 + task * mat3 | pid))
+```
+
+# priors #
+
+```{r}
+priors <- c(
+  set_prior("normal(0, 1)", class = "Intercept"),
+  set_prior("normal(0, 1)", class = "b"),
+  set_prior('normal(0, 0.5)', class = 'sigma'), # SD of individual scores
+  set_prior('normal(0, 0.5)', class = 'sd'),
+  set_prior("lkj(2)", class = "cor") # correlation between varying effects log-units
+)
+```
+
+# run the model #
+
+```{r}
+plan(multicore)
+bd5.1cs <- brm(formula = formula,
+        data = data_diffd, family = gaussian(),
+        prior = priors,
+        iter = 6000, warmup = 2000, cores = 4, chains = 4,
+        control = list(adapt_delta = 0.95), # max_treedepth = 15),
+        save_pars = save_pars(all=TRUE),
+        seed = 123,
+        # init_r = 0.1,
+        file = "models/bd5.1cs")
+summary(bd5.1cs)
+```
+
+let's take a look 
+
+```{r}
+# chains
+plot(bd5.1cs)
+# summary
+print(bd5.1cs)
+# fixed effects
+fixef(bd5.1cs)
+```
+
+pp_checks
+
+```{r}
+ppbd5.1cs <- pp_check(bd5.1cs, ndraws = 100)
+ppbd5.1cs
+```
+
+# now use the SDs, cors and effect of matrix type as a guide #
+
+```{r}
+subj_n = 500  # number of subjects
+
+# varying effects 
+u0s_sd = 0.6  # varying intercept SD for subjects
+u1s_sd = 0.7  # varying b1 slope SD for subjects (effect of mat2v1)
+u2s_sd = 0.2  # varying b2 slope SD for subjects (effect of mat3v1)
+r01s = -0.7   # correlation between varying effects 0 and 1 for subjects
+r02s = 0.2   # correlation between varying effects 0 and 2 for subjects
+r12s = -0.1   # correlation between varying effects 1 and 2 for subjects
+
+# fixed effects in standardised units?
+b0 = 0      # intercept
+b1 = -0.4     # fixed effect of matrix type m2v1
+b2 = 0.2    # fixed effect of matrix type m3v1
+b3 = 0.2    # fixed effect of agent
+
+# sigma
+sigma_sd = 0.4 # error SD
+
+d4 <- add_random(subj = subj_n) %>%
+  add_between(.by = "subj", 
+              agent = c("human", "AI")) %>%
+  add_contrast("agent", "anova", add_cols = TRUE, colnames = "agentd") %>%
+  add_within(matrix_type = c("mat1", "mat2", "mat3")) %>% 
+  add_contrast("matrix_type", "anova", add_cols = TRUE, 
+               colnames = c("mat2v1", "mat3v1")) %>%
+  add_ranef("subj", u0s = u0s_sd, u1s = u1s_sd, u2s = u2s_sd, 
+            .cors = c(r01s, r02s, r12s)) %>%
+  add_ranef(sigma = sigma_sd) %>%
+  # calculate DV
+  mutate(y = b0 + u0s + (b1 + u1s) * mat2v1 + (b2 + u2s) * mat3v1 
+         + b3 * agentd + sigma)
+head(d4)
+```
+
+plot
+
+```{r}
+ggplot(d4, aes(matrix_type, y, color = agent)) +
+  geom_hline(yintercept = b0) +
+  geom_hline(yintercept = 0, colour = "RED") +
+  geom_violin(alpha = 0.5) +
+  stat_summary(fun = mean,
+               fun.min = \(x){mean(x) - sd(x)/sqrt(250)},
+               fun.max = \(x){mean(x) + sd(x)/sqrt(250)},
+               position = position_dodge(width = 0.9)) +
+  scale_color_brewer(palette = "Dark2")
+```
+
+```{r}
+ggplot(d4, aes(x=y, fill=agent)) +
+   geom_density(alpha = 0.3, colour = "darkgrey") +
+   scale_fill_brewer(palette = "Dark2")+
+   theme_bw()+
+   theme(panel.grid = element_blank()) +
+   theme(legend.position = "none") +
+   ggtitle("response by condition") +
+   facet_wrap(~matrix_type, ncol = 1)
+```
+
+## fit the model ##
+
+formula
+
+```{r}
+formula = bf(y ~ 1 + agentd * mat2v1 + agentd * mat3v1 +
+               (1 + mat2v1 + mat3v1 | subj))
+```
+
+set priors
+
+```{r}
+priors <- c(
+  set_prior("normal(0, 1)", class = "Intercept"),
+  set_prior("normal(0, 0.5)", class = "b"),
+  set_prior("normal(0, 0.5)", class = "sigma"),
+  set_prior('normal(0, 0.5)', class = 'sd'),
+  set_prior("lkj(2)", class = "cor") # correlation between varying effects log-units
+)
+```
+
+build the model
+
+```{r}
+t1 <- Sys.time()
+
+plan(multicore)
+fit_2 <-
+  brm(data = d4,
+      family = gaussian,
+      formula = formula,
+      prior = priors,
+      iter = 5000, warmup = 2000,
+      cores = 8, 
+      control = list(adapt_delta = 0.99),
+      save_pars = save_pars(all=TRUE),
+      seed = 1)
+
+t2 <- Sys.time()
+
+t2 - t1
+
+# Time difference of 2.248594 mins
+```
+
+let's take a look 
+
+```{r}
+# chains
+plot(fit_2)
+# summary
+print(fit_2)
+# fixed effects
+fixef(fit_2)
+
+# save initial fit
+saveRDS(fit_2, "models/fit_2.rds")
+```
+
+build a new model with the update function and compare how long it takes
+
+simulate the data and build the model
+
+
+```{r}
+set.seed(2)
+
+d5 <- add_random(subj = subj_n) %>%
+  add_between(.by = "subj",
+              agent = c("human", "AI")) %>%
+  add_contrast("agent", "anova", add_cols = TRUE, colnames = "agentd") %>%
+  add_within(matrix_type = c("mat1", "mat2", "mat3")) %>%
+  add_contrast("matrix_type", "anova", add_cols = TRUE,
+               colnames = c("mat2v1", "mat3v1")) %>%
+  add_ranef("subj", u0s = u0s_sd, u1s = u1s_sd, u2s = u2s_sd,
+            .cors = c(r01s, r02s, r12s)) %>%
+  add_ranef(sigma = sigma_sd) %>%
+  # calculate DV
+  mutate(y = b0 + u0s + (b1 + u1s) * mat2v1 + (b2 + u2s) * mat3v1
+         + b3 * agentd + sigma) 
+head(d5)
+#
+t1 <- Sys.time()
+
+updated_fit_2 <-
+  update(fit_2,
+         newdata = d5,
+         seed = 2)
+
+t2 <- Sys.time()
+
+t2 - t1
+# 
+# # Time difference of 1.881184
+
+
+```
+
+let's take a look 
+
+```{r}
+# chains
+plot(updated_fit_2)
+# summary
+print(updated_fit_2)
+# fixed effects
+fixef(updated_fit_2)
+
+# save updated fit
+# saveRDS(updated_fit_2, "models/updated_fit_2.rds")
+```
+
+fit_2 and updated_fit_2 get these warnings:
+
+Warning: 3 of 4 chains had an E-BFMI less than 0.2.
+See https://mc-stan.org/misc/warnings for details.
+
+
+ok, so, a few options.
+
+- 1) run with more iterations. that's what we do for the real deal.
+
+- 2) run with the warnings and don't worry because the fixed effects look sensible.
+
+- 3) or run without the interactions in the formula?? as we are simulated two sets of average effects??
+  - this would not be in the real model, but it can be in the sim because we have
+  simulated no interactions i.e.,  zero.
+  - the model should run faster.
+
+approx. 2mins per model is quite some time. if 2N x 3 fxsize x 1000 reps = 5000
+x 2 mins per model = 10k mins. 167 hours. ~ 1 week. iMac should be faster, so test
+it and see.
+
+let's just accept the sampling errors, given that we know the ground truth. The reason
+is that modelling and computer memory becomes a problem. and we can't do it anyway. 
+also, let's just try N=500.
+
+
+## fit a model without interactions ##
+
+formula
+
+```{r}
+formula = bf(y ~ 1 + agentd + mat2v1 + mat3v1 +
+               (1 + mat2v1 + mat3v1 | subj))
+```
+
+set priors
+
+and set stronger priors for the intercept, to help the model run smoother for the sims. 
+maybe for the real thing we would switch back.
+
+```{r}
+priors <- c(
+  set_prior("normal(0, 0.5)", class = "Intercept"),
+  set_prior("normal(0, 0.5)", class = "b"),
+  set_prior("normal(0, 0.5)", class = "sigma"),
+  set_prior('normal(0, 0.5)', class = 'sd'),
+  set_prior("lkj(2)", class = "cor") # correlation between varying effects log-units
+)
+```
+
+build the model
+
+```{r}
+subj_n = 500  # number of subjects
+
+# varying effects 
+u0s_sd = 0.6  # varying intercept SD for subjects
+u1s_sd = 0.7  # varying b1 slope SD for subjects (effect of mat2v1)
+u2s_sd = 0.2  # varying b2 slope SD for subjects (effect of mat3v1)
+r01s = -0.7   # correlation between varying effects 0 and 1 for subjects
+r02s = 0.2   # correlation between varying effects 0 and 2 for subjects
+r12s = -0.1   # correlation between varying effects 1 and 2 for subjects
+
+# fixed effects in standardised units?
+b0 = 0      # intercept
+b1 = -0.4     # fixed effect of matrix type m2v1
+b2 = 0.2    # fixed effect of matrix type m3v1
+b3 = 0.2    # fixed effect of agent
+
+# sigma
+sigma_sd = 0.4 # error SD
+
+set.seed(1)
+
+d6 <- add_random(subj = subj_n) %>%
+  add_between(.by = "subj", 
+              agent = c("human", "AI")) %>%
+  add_contrast("agent", "anova", add_cols = TRUE, colnames = "agentd") %>%
+  add_within(matrix_type = c("mat1", "mat2", "mat3")) %>% 
+  add_contrast("matrix_type", "anova", add_cols = TRUE, 
+               colnames = c("mat2v1", "mat3v1")) %>%
+  add_ranef("subj", u0s = u0s_sd, u1s = u1s_sd, u2s = u2s_sd, 
+            .cors = c(r01s, r02s, r12s)) %>%
+  add_ranef(sigma = sigma_sd) %>%
+  # calculate DV
+  mutate(y = b0 + u0s + (b1 + u1s) * mat2v1 + (b2 + u2s) * mat3v1 
+         + b3 * agentd + sigma)
+head(d6)
+
+t1 <- Sys.time()
+
+plan(multicore)
+fit_ni <-
+  brm(data = d6,
+      family = gaussian,
+      formula = formula,
+      prior = priors,
+      iter = 2000, warmup = 1000,
+      cores = 20, 
+      control = list(adapt_delta = 0.95),
+      save_pars = save_pars(all=TRUE),
+      seed = 1)
+
+t2 <- Sys.time()
+
+t2 - t1
+
+# Time difference of 1.855623 mins macbook
+
+# Time difference of 1.417444 mins iMac
+
+# Time difference of 2.248195 mins imac with adapt_delta = 0.99, intercept prior 0, 0.5
+
+# Time difference of 1.15 mins imac with adapt_delta = 0.95, intercept prior 0, 0.5, iter=2000, warm-up=1000.
+```
+
+plot the data
+
+```{r}
+# ggplot(d6, aes(matrix_type, y, color = agent)) +
+#   geom_hline(yintercept = b0) +
+#   geom_hline(yintercept = 0, colour = "RED") +
+#   geom_violin(alpha = 0.5) +
+#   stat_summary(fun = mean,
+#                fun.min = \(x){mean(x) - sd(x)/sqrt(250)},
+#                fun.max = \(x){mean(x) + sd(x)/sqrt(250)},
+#                position = position_dodge(width = 0.9)) +
+#   scale_color_brewer(palette = "Dark2")
+```
+
+```{r}
+# ggplot(d6, aes(x=y, fill=agent)) +
+#    geom_density(alpha = 0.3, colour = "darkgrey") +
+#    scale_fill_brewer(palette = "Dark2")+
+#    theme_bw()+
+#    theme(panel.grid = element_blank()) +
+#    theme(legend.position = "none") +
+#    ggtitle("response by condition") +
+#    facet_wrap(~matrix_type, ncol = 1)
+```
+
+Warning: 4 of 4 chains had an E-BFMI less than 0.2.
+See https://mc-stan.org/misc/warnings for details.
+
+we could increase iter and 
+change control parameters. But for now, I think this is fine, as it will save time
+and the fixed effects look fine.
+
+For the real thing, we would want to change settings though, I think.
+
+let's take a look 
+
+```{r}
+# chains
+plot(fit_ni)
+# summary
+print(fit_ni)
+# fixed effects
+fixef(fit_ni)
+
+# save initial fit
+saveRDS(fit_ni, "models/fit_ni.rds")
+```
+
+update the fit with new data
+
+```{r}
+set.seed(2)
+
+d7 <- add_random(subj = subj_n) %>%
+  add_between(.by = "subj", 
+              agent = c("human", "AI")) %>%
+  add_contrast("agent", "anova", add_cols = TRUE, colnames = "agentd") %>%
+  add_within(matrix_type = c("mat1", "mat2", "mat3")) %>% 
+  add_contrast("matrix_type", "anova", add_cols = TRUE, 
+               colnames = c("mat2v1", "mat3v1")) %>%
+  add_ranef("subj", u0s = u0s_sd, u1s = u1s_sd, u2s = u2s_sd, 
+            .cors = c(r01s, r02s, r12s)) %>%
+  add_ranef(sigma = sigma_sd) %>%
+  # calculate DV
+  mutate(y = b0 + u0s + (b1 + u1s) * mat2v1 + (b2 + u2s) * mat3v1 
+         + b3 * agentd + sigma)
+head(d7)
+#
+t1 <- Sys.time()
+
+updated_fit_ni <-
+  update(fit_ni,
+         newdata = d7,
+         seed = 2)
+
+t2 <- Sys.time()
+
+t2 - t1
+# 
+# Time difference of 1.766727 mins 
+
+# Time difference of 1.148983 mins imac with adapt_delta = 0.95, intercept prior 0, 0.5, iter=2000, warm-up=1000.
+```
+
+
+Warning: 20 of 4000 (0.0%) transitions ended with a divergence.
+See https://mc-stan.org/misc/warnings for details.
+
+Warning: 2 of 4 chains had an E-BFMI less than 0.2.
+See https://mc-stan.org/misc/warnings for details.
+
+let's take a look 
+
+```{r}
+# chains
+plot(updated_fit_ni)
+# summary
+print(updated_fit_ni)
+# fixed effects
+fixef(updated_fit_ni)
+
+```
+
+ok. with slightly stronger priors on the intercept, things look a little better.
+
+probably fine to sim now. at least with a little bit of caution.
+
+
+## 8) create a function to simulate multiple datasets ##
+
+```{r}
+sim <- function(subj_n = 500,  # these can be changed when calling the function
+                b0 = 0, b1 = -0.4, b2 = 0.2, b3 = 0.2,      # fixed effects 
+                u0s_sd = 0.6,  # random intercepts
+                u1s_sd = 0.7, u2s_sd = 0.2, # random slope
+                r01s = -0.7, r02s = 0.2, r12s = -0.1,   # cors
+                sigma_sd = 0.4,           # error term
+                ... # helps the function work with pmap() below
+                ) {
+
+  # set up data structure
+  data <- add_random(subj = subj_n) %>%
+    add_between(.by = "subj", 
+                agent = c("human", "AI")) %>%
+    add_contrast("agent", "anova", add_cols = TRUE, colnames = "agentd") %>%
+    add_within(matrix_type = c("mat1", "mat2", "mat3")) %>% 
+    add_contrast("matrix_type", "anova", add_cols = TRUE, 
+                 colnames = c("mat2v1", "mat3v1")) %>%
+    add_ranef("subj", u0s = u0s_sd, u1s = u1s_sd, u2s = u2s_sd, 
+              .cors = c(r01s, r02s, r12s)) %>%
+    add_ranef(sigma = sigma_sd) %>%
+    # calculate DV
+    mutate(y = b0 + u0s + (b1 + u1s) * mat2v1 + (b2 + u2s) * mat3v1 
+           + b3 * agentd + sigma)
+  
+    # glimpse(data) # only use this when testing the code
+}
+```
+
+Here’s a quick example of how our function works.
+
+```{r}
+sim(subj_n = 500, b0 = 0, b3 = 0.2) # if you uncomment glimpse above,
+# it will let you glimpse the data that's generated. this is useful for checking / testing code purposes.
+```
+
+let's scale it up to multiple reps
+
+```{r}
+x <- crossing(
+  rep = 1:1000, # number of replicates
+  subj_n = 500, # range of subject N
+  b3 = 0.2, # effects of agent - maybe for the real thing we would 
+) %>%
+  mutate(d = pmap(., sim)) %>%
+  mutate(fit = map2(d, rep, ~update(fit_ni, newdata = .x, seed = .y)))
+
+```
+
+
+ok, that's good, but that many models and datasets can get big quickly and exhaust vector memory.
+
+So, let's create a different function, which does not save the data or the 
+brms models. Instead, we just save the parameter values of interest from the model.
+
+Something else to consider: maybe the models would fit better if they had more data
+at the trial level per pid. can we create data with 6 data points per pid e.g., 
+each version (normal and flipped), instead of averaging?
+
+let's try that first.
+
+## 9) create new data and build a model ##
+
+## fit a model ##
+
+formula
+
+```{r}
+formula = bf(y ~ 1 + agentd + mat2v1 + mat3v1 +
+               (1 + mat2v1 + mat3v1 | subj) +
+               (1 | item))
+```
+
+check priors
+
+```{r}
+get_prior(data = d8,
+          family = gaussian,
+          formula)
+```
+
+visualise prior settings
+
+maybe we could set narrow priors, given that we know the ground truth??
+and then in the real thing we can set more weakly informative priors??
+
+```{r}
+visualize("normal(0, 0.5)", "normal(0, 0.2)", "normal(0, 0.1)", 
+          xlim = c(-4, 4))
+```
+
+set priors
+
+and set stronger priors for the intercept, to help the model run smoother for the sims. 
+maybe for the real thing we would switch back.
+
+```{r}
+priors <- c(
+  set_prior("normal(0, 0.5)", class = "Intercept"),
+  set_prior("normal(0, 0.5)", class = "b"),
+  set_prior("normal(0, 0.5)", class = "sigma"),
+  set_prior('normal(0, 0.5)', class = 'sd'),
+  set_prior("lkj(2)", class = "cor") # correlation between varying effects log-units
+)
+```
+
+build the model
+
+```{r}
+subj_n = 500  # number of subjects
+item_n = 2  # number of items 
+
+# varying effects 
+u0s_sd = 0.6  # varying intercept SD for subjects
+u0i_sd = 0.1  # varying intercept SD for items
+u1s_sd = 0.7  # varying b1 slope SD for subjects (effect of mat2v1)
+u2s_sd = 0.2  # varying b2 slope SD for subjects (effect of mat3v1)
+r01s = -0.7   # correlation between varying effects 0 and 1 for subjects
+r02s = 0.2   # correlation between varying effects 0 and 2 for subjects
+r12s = -0.1   # correlation between varying effects 1 and 2 for subjects
+
+# fixed effects in standardised units?
+b0 = 0      # intercept
+b1 = -0.4     # fixed effect of matrix type m2v1
+b2 = 0.2    # fixed effect of matrix type m3v1
+b3 = 0.2    # fixed effect of agent
+
+# sigma
+sigma_sd = 0.4 # error SD
+
+set.seed(1)
+
+d8 <- add_random(subj = subj_n, item = item_n) %>%
+  add_between(.by = "subj", 
+              agent = c("human", "AI")) %>%
+  add_contrast("agent", "anova", add_cols = TRUE, colnames = "agentd") %>%
+  add_within(.by = "item",
+             matrix_type = c("mat1", "mat2", "mat3")) %>% 
+  add_contrast("matrix_type", "anova", add_cols = TRUE, 
+               colnames = c("mat2v1", "mat3v1")) %>%
+  add_ranef("subj", u0s = u0s_sd, u1s = u1s_sd, u2s = u2s_sd, 
+            .cors = c(r01s, r02s, r12s)) %>%
+  add_ranef("item", u0i = u0i_sd) %>%
+  add_ranef(sigma = sigma_sd) %>%
+  # calculate DV
+  mutate(y = b0 + u0s + u0i + (b1 + u1s) * mat2v1 + (b2 + u2s) * mat3v1 
+         + b3 * agentd + sigma)
+head(d8)
+
+t1 <- Sys.time()
+
+plan(multicore)
+fit_ni_2 <-
+  brm(data = d8,
+      family = gaussian,
+      formula = formula,
+      prior = priors,
+      iter = 2000, warmup = 1000,
+      cores = 20, 
+      control = list(adapt_delta = 0.95),
+      save_pars = save_pars(all=TRUE),
+      seed = 1)
+
+t2 <- Sys.time()
+
+t2 - t1
+
+# Time difference of 3.586783 mins
+```
+
+plot the data
+
+```{r}
+ggplot(d8, aes(matrix_type, y, color = agent)) +
+  geom_hline(yintercept = b0) +
+  geom_hline(yintercept = 0, colour = "RED") +
+  geom_violin(alpha = 0.5) +
+  stat_summary(fun = mean,
+               fun.min = \(x){mean(x) - sd(x)/sqrt(250)},
+               fun.max = \(x){mean(x) + sd(x)/sqrt(250)},
+               position = position_dodge(width = 0.9)) +
+  scale_color_brewer(palette = "Dark2")
+```
+
+```{r}
+ggplot(d8, aes(x=y, fill=agent)) +
+   geom_density(alpha = 0.3, colour = "darkgrey") +
+   scale_fill_brewer(palette = "Dark2")+
+   theme_bw()+
+   theme(panel.grid = element_blank()) +
+   theme(legend.position = "none") +
+   ggtitle("response by condition") +
+   facet_wrap(~matrix_type, ncol = 1)
+```
+
+Warning: 3 of 4000 (0.0%) transitions ended with a divergence.
+See https://mc-stan.org/misc/warnings for details.
+
+ok, this fits better, BUT takes 3.5 minutes.
+
+we could increase iter and 
+change control parameters. But for now, I think this is fine, as it will save time
+and the fixed effects look fine.
+
+For the real thing, we would want to change settings though, I think.
+
+let's take a look 
+
+```{r}
+# chains
+plot(fit_ni_2)
+# summary
+print(fit_ni_2)
+# fixed effects
+fixef(fit_ni_2)
+
+# save initial fit
+saveRDS(fit_ni_2, "models/fit_ni_2.rds")
+```
+
+update the fit with new data
+
+```{r}
+set.seed(2)
+
+d9 <- add_random(subj = subj_n, item = item_n) %>%
+  add_between(.by = "subj", 
+              agent = c("human", "AI")) %>%
+  add_contrast("agent", "anova", add_cols = TRUE, colnames = "agentd") %>%
+  add_within(.by = "item",
+             matrix_type = c("mat1", "mat2", "mat3")) %>% 
+  add_contrast("matrix_type", "anova", add_cols = TRUE, 
+               colnames = c("mat2v1", "mat3v1")) %>%
+  add_ranef("subj", u0s = u0s_sd, u1s = u1s_sd, u2s = u2s_sd, 
+            .cors = c(r01s, r02s, r12s)) %>%
+  add_ranef("item", u0i = u0i_sd) %>%
+  add_ranef(sigma = sigma_sd) %>%
+  # calculate DV
+  mutate(y = b0 + u0s + u0i + (b1 + u1s) * mat2v1 + (b2 + u2s) * mat3v1 
+         + b3 * agentd + sigma)
+head(d9)
+#
+t1 <- Sys.time()
+
+updated_fit_ni_2 <-
+  update(fit_ni_2,
+         newdata = d9,
+         seed = 2)
+
+t2 <- Sys.time()
+
+t2 - t1
+# 
+# Time difference of 3.191068 mins
+```
+
+
+
+
+let's take a look 
+
+```{r}
+# chains
+plot(updated_fit_ni_2)
+# summary
+print(updated_fit_ni_2)
+# fixed effects
+fixef(updated_fit_ni_2)
+```
+
+
+how about we run the update again but with within-chain parallelisation, just to see: 
+https://cran.r-project.org/web/packages/brms/vignettes/brms_threading.html
+
+update the fit with new data
+
+```{r}
+set.seed(3)
+
+d9b <- add_random(subj = subj_n, item = item_n) %>%
+  add_between(.by = "subj", 
+              agent = c("human", "AI")) %>%
+  add_contrast("agent", "anova", add_cols = TRUE, colnames = "agentd") %>%
+  add_within(.by = "item",
+             matrix_type = c("mat1", "mat2", "mat3")) %>% 
+  add_contrast("matrix_type", "anova", add_cols = TRUE, 
+               colnames = c("mat2v1", "mat3v1")) %>%
+  add_ranef("subj", u0s = u0s_sd, u1s = u1s_sd, u2s = u2s_sd, 
+            .cors = c(r01s, r02s, r12s)) %>%
+  add_ranef("item", u0i = u0i_sd) %>%
+  add_ranef(sigma = sigma_sd) %>%
+  # calculate DV
+  mutate(y = b0 + u0s + u0i + (b1 + u1s) * mat2v1 + (b2 + u2s) * mat3v1 
+         + b3 * agentd + sigma)
+head(d9b)
+#
+t1 <- Sys.time()
+
+updated_fit_ni_2b <-
+  update(fit_ni_2,
+         newdata = d9b,
+         seed = 3,
+         chains = 4,
+         cores = 10,
+         threads = threading(2))
+
+t2 <- Sys.time()
+
+t2 - t1
+# 
+# Time difference of 4.086878 mins
+```
+
+threading required the model to be recompiled. so the time estimate needs comparing to the initial model build time.
+
+best way to check would be to update a second model. see next
+
+update the fit with new data
+
+```{r}
+set.seed(4)
+
+d9c <- add_random(subj = subj_n, item = item_n) %>%
+  add_between(.by = "subj", 
+              agent = c("human", "AI")) %>%
+  add_contrast("agent", "anova", add_cols = TRUE, colnames = "agentd") %>%
+  add_within(.by = "item",
+             matrix_type = c("mat1", "mat2", "mat3")) %>% 
+  add_contrast("matrix_type", "anova", add_cols = TRUE, 
+               colnames = c("mat2v1", "mat3v1")) %>%
+  add_ranef("subj", u0s = u0s_sd, u1s = u1s_sd, u2s = u2s_sd, 
+            .cors = c(r01s, r02s, r12s)) %>%
+  add_ranef("item", u0i = u0i_sd) %>%
+  add_ranef(sigma = sigma_sd) %>%
+  # calculate DV
+  mutate(y = b0 + u0s + u0i + (b1 + u1s) * mat2v1 + (b2 + u2s) * mat3v1 
+         + b3 * agentd + sigma)
+head(d9c)
+#
+t1 <- Sys.time()
+
+updated_fit_ni_2c <-
+  update(updated_fit_ni_2b,
+         newdata = d9c,
+         seed = 4)
+
+t2 <- Sys.time()
+
+t2 - t1
+# 
+# Time difference of 2.802709 mins
+```
+
+
+ok, threading doesn't seem to speed things up much compared to multicore, at least in this instance.
+
+
+
+## 10) create a function to simulate multiple datasets and build models but only store parameters of interest ##
+
+first, create a quick fit to test the new function out.
+
+create the data, but just with 20 pts to test it
+
+```{r}
+subj_n = 20  # number of subjects
+item_n = 2  # number of items 
+
+# varying effects 
+u0s_sd = 0.6  # varying intercept SD for subjects
+u0i_sd = 0.1  # varying intercept SD for items
+u1s_sd = 0.7  # varying b1 slope SD for subjects (effect of mat2v1)
+u2s_sd = 0.2  # varying b2 slope SD for subjects (effect of mat3v1)
+r01s = -0.7   # correlation between varying effects 0 and 1 for subjects
+r02s = 0.2   # correlation between varying effects 0 and 2 for subjects
+r12s = -0.1   # correlation between varying effects 1 and 2 for subjects
+
+# fixed effects in standardised units?
+b0 = 0      # intercept
+b1 = -0.4     # fixed effect of matrix type m2v1
+b2 = 0.2    # fixed effect of matrix type m3v1
+b3 = 0.2    # fixed effect of agent
+
+# sigma
+sigma_sd = 0.4 # error SD
+
+set.seed(1)
+
+d <- add_random(subj = subj_n, item = item_n) %>%
+  add_between(.by = "subj", 
+              agent = c("human", "AI")) %>%
+  add_contrast("agent", "anova", add_cols = TRUE, colnames = "agentd") %>%
+  add_within(.by = "item",
+             matrix_type = c("mat1", "mat2", "mat3")) %>% 
+  add_contrast("matrix_type", "anova", add_cols = TRUE, 
+               colnames = c("mat2v1", "mat3v1")) %>%
+  add_ranef("subj", u0s = u0s_sd, u1s = u1s_sd, u2s = u2s_sd, 
+            .cors = c(r01s, r02s, r12s)) %>%
+  add_ranef("item", u0i = u0i_sd) %>%
+  add_ranef(sigma = sigma_sd) %>%
+  # calculate DV
+  mutate(y = b0 + u0s + u0i + (b1 + u1s) * mat2v1 + (b2 + u2s) * mat3v1 
+         + b3 * agentd + sigma)
+head(d)
+```
+
+formula
+
+```{r}
+formula = bf(y ~ 1 + agentd + mat2v1 + mat3v1 +
+               (1 + mat2v1 + mat3v1 | subj) +
+               (1 | item))
+```
+
+set priors
+
+```{r}
+priors <- c(
+  set_prior("normal(0, 0.5)", class = "Intercept"),
+  set_prior("normal(0, 0.5)", class = "b"),
+  set_prior("normal(0, 0.5)", class = "sigma"),
+  set_prior('normal(0, 0.5)', class = 'sd'),
+  set_prior("lkj(2)", class = "cor") # correlation between varying effects log-units
+)
+```
+
+fit the model
+
+```{r}
+t1 <- Sys.time()
+
+plan(multicore)
+fit_ni_3 <-
+  brm(data = d,
+      family = gaussian,
+      formula = formula,
+      prior = priors,
+      iter = 2000, warmup = 1000,
+      cores = 20, 
+      control = list(adapt_delta = 0.95),
+      save_pars = save_pars(all=TRUE),
+      seed = 1)
+
+t2 <- Sys.time()
+
+t2 - t1
+
+# Time difference of 36.1739 secs macbook
+
+# Time difference of 25.8985 secs imac
+```
+
+let's take a look 
+
+```{r}
+# chains
+plot(fit_ni_3)
+# summary
+print(fit_ni_3)
+# fixed effects
+fixef(fit_ni_3)
+```
+
+ok, now update the fit and only save parameters of interest and not the full model
+
+```{r}
+set.seed(2)
+
+d2 <- add_random(subj = subj_n, item = item_n) %>%
+  add_between(.by = "subj", 
+              agent = c("human", "AI")) %>%
+  add_contrast("agent", "anova", add_cols = TRUE, colnames = "agentd") %>%
+  add_within(.by = "item",
+             matrix_type = c("mat1", "mat2", "mat3")) %>% 
+  add_contrast("matrix_type", "anova", add_cols = TRUE, 
+               colnames = c("mat2v1", "mat3v1")) %>%
+  add_ranef("subj", u0s = u0s_sd, u1s = u1s_sd, u2s = u2s_sd, 
+            .cors = c(r01s, r02s, r12s)) %>%
+  add_ranef("item", u0i = u0i_sd) %>%
+  add_ranef(sigma = sigma_sd) %>%
+  # calculate DV
+  mutate(y = b0 + u0s + u0i + (b1 + u1s) * mat2v1 + (b2 + u2s) * mat3v1 
+         + b3 * agentd + sigma)
+head(d2)
+#
+
+t1 <- Sys.time()
+
+updated_fit_ni_3 <-
+  update(fit_ni_3,
+         newdata = d2,
+         seed = 2) %>%
+  fixef() %>% 
+  data.frame() %>% 
+  rownames_to_column("parameter")
+
+t2 <- Sys.time()
+
+t2 - t1
+
+# Time difference of 5.262378 secs macbook
+
+# Time difference of 4.544331 secs imac
+```
+
+take a look
+
+```{r}
+fixef(updated_fit_ni_3)
+
+updated_fit_ni_3
+```
+
+
+
+see SK's code for a workflow... and maybe see the faux package also for a workflow
+
+create a function called sim
+
+```{r}
+sim <- function(subj_n = 20, item_n = 2,  # these can be changed when calling the function
+                b0 = 0, b1 = -0.4, b2 = 0.2, b3 = 0.2,      # fixed effects 
+                u0s_sd = 0.6, u0i_sd = 0.1,  # random intercepts pid and items
+                u1s_sd = 0.7, u2s_sd = 0.2, # random slope
+                r01s = -0.7, r02s = 0.2, r12s = -0.1,   # cors
+                sigma_sd = 0.4,           # error term
+                ... # helps the function work with pmap() below
+                ) {
+
+  # set up data structure
+  data <- add_random(subj = subj_n, item = item_n) %>%
+    add_between(.by = "subj", 
+                agent = c("human", "AI")) %>%
+    add_contrast("agent", "anova", add_cols = TRUE, colnames = "agentd") %>%
+    add_within(matrix_type = c("mat1", "mat2", "mat3")) %>% 
+    add_contrast("matrix_type", "anova", add_cols = TRUE, 
+                 colnames = c("mat2v1", "mat3v1")) %>%
+    add_ranef("subj", u0s = u0s_sd, u1s = u1s_sd, u2s = u2s_sd, 
+              .cors = c(r01s, r02s, r12s)) %>%
+    add_ranef("item", u0i = u0i_sd) %>%
+    add_ranef(sigma = sigma_sd) %>%
+    # calculate DV
+    mutate(y = b0 + u0s + u0i + (b1 + u1s) * mat2v1 + (b2 + u2s) * mat3v1 
+         + b3 * agentd + sigma)
+  
+    # glimpse(data) # only use this when testing the code
+}
+```
+
+Here’s a quick example of how our function works.
+
+```{r}
+sim(subj_n = 20, b0 = 0, b3 = 0.2) # if you uncomment glimpse above,
+# it will let you glimpse the data that's generated. this is useful for checking / testing code purposes.
+```
+
+let's scale it up to multiple reps
+
+and only save the parameters of interest rather than the full brms model.
+
+```{r}
+x <- crossing(
+  rep = 1:2, # number of replicates
+  subj_n = 20, # range of subject N
+  b3 = 0.2, # effects of agent - maybe for the real thing we would 
+) %>%
+  mutate(d = pmap(., sim)) %>%
+  mutate(params = map2(d, rep, ~update(fit_ni_3, newdata = .x, seed = .y) %>%
+                     fixef() %>% 
+                     data.frame() %>% 
+                     rownames_to_column("parameter"))) %>% 
+  select(-d) # adding this line in removes the data from the stored tibble 'x'
+
+```
+
+let's take a look
+
+```{r}
+head(x)
+```
+
+and unnest params
+
+```{r}
+x %>% 
+  unnest(params)
+x
+```
+
+ok, this looks good. 
+
+
+
+
+
+
+
+
+unnest and save out some stuff. This is useful as it can take some time to run 1000s of sims.
+
+Not sure the data are always necessary, but for now, I'd like to have it.
+
+```{r}
+# data?
+sim_d <- x %>%
+  select(-fit) %>%
+  unnest(d)
+head(sim_d)
+
+# save the data
+write_csv(sim_d, "data/sim_d.csv")
+```
+
+select parameters of interest to summarise and visualise
+
+```{r}
+parameters <-
+  x %>% 
+  mutate(condition = map(fit, ~ fixef(.) %>% 
+                           data.frame() %>% 
+                           rownames_to_column("parameter"))) %>% 
+  unnest(condition)
+
+parameters %>% 
+  select(-d, -fit) %>% 
+  filter(parameter == "agentd") %>% 
+  head()
+```
+
+save out parameters
+
+```{r}
+sim_p <- parameters %>%
+  select(-d, -fit)
+head(sim_p)
+
+# save the parameters
+write_csv(sim_p, "data/sim_p.csv")
+```
+
+
+diagnostics (these aren't completed yet because I need to figure out the best way to look at them)
+
+rhat -  this needs working on to figure out how to remove it and plot it. rhat is stored in fit$fit. Some homework on map is required.
+neff - this works.
+
+chains? (chains would get complicated becuase there are 1000s of them per model). maybe randomly sample a bunch models and 
+take a look at the chains. It saves sampling loads?
+
+```{r}
+# SK code
+# fits <- x %>% 
+#   mutate(fits = map(fit, fit)) %>% 
+#                   data.frame() %>% 
+#                   rownames_to_column("parameter")))
+#   unnest(fits)
+# fits
+#   
+#   ggplot(aes(x = fits)) +
+#   geom_histogram(bins = 20)
+# 
+# 
+# rhat <- x %>%
+#   select(-d) %>% 
+#   mutate(rhat = map(fit, rhat)) %>% 
+#   unnest(rhat)
+# head(rhat)
+
+neff <- x %>% 
+  mutate(neff = map(fit, neff_ratio)) %>% 
+  unnest(neff)
+head(neff)
+
+# diag <- x %>% 
+#   mutate(rhat = map(fit, rhat),
+#          neff = map(fit, neff)) %>% 
+#   unnest(rhat, neff)
+# head(diag)
+
+# save the diagnostics or just plot them and save the plots??
+```
+
+plot diagnostics
+
+```{r}
+# rhat %>% 
+#   ggplot(aes(x = rhat)) +
+#   geom_histogram(bins = 20)
+# 
+# ggsave ("figures/rhat.jpeg")
+# 
+# neff %>% 
+#   ggplot(aes(x = neff)) +
+#   geom_histogram(bins = 20)
+# 
+# ggsave ("figures/neff.jpeg")
+```
+
+calculate power i.e., % Q2.5 > 0
+
+```{r}
+power <- parameters %>% 
+  filter(parameter == "agentd") %>%
+  group_by(subj_n) %>% 
+  mutate(check = ifelse(Q2.5 > 0, 1, 0)) %>% 
+  summarise(power = mean(check)) %>% 
+  mutate(subj_n = factor(subj_n))
+power
+```
+
+plot power
+
+```{r}
+p_power <- ggplot(power, aes(x = subj_n, y = power, fill = power)) +
+  geom_tile() +
+  geom_text(aes(label = sprintf("%.2f", power)), color = "white", size = 10) +
+  scale_fill_viridis_c(limits = c(0, 1)) 
+p_power
+
+ggsave ("figures/power.jpeg")
+```
+
+plot parameters and include power as a text label
+
+wrangle
+
+```{r}
+plot_params <- parameters %>%
+  select(-d, -fit) %>% 
+  filter(parameter == "agentd") %>%
+  mutate(below_zero = if_else(Q2.5 < 0, "yes", "no"), 
+         below_zero = factor(below_zero, levels = c("no", "yes")),
+         subj_n = factor(subj_n)) %>% 
+  inner_join(power, by = c("subj_n")) %>% 
+  mutate(power = round(power * 100, 0)) %>% 
+  mutate(power = if_else(power == 100, 99, power)) # avoid power = 100% when it isn't due to rounding
+head(plot_params)
+```
+
+plot
+
+the one that works so far (but with only 2 hlines and b1 is fixed at 0.5, which isn't right)
+
+```{r}
+p_params <- plot_params %>%
+  ggplot(aes(x = rep, y = Estimate, ymin = Q2.5, ymax = Q97.5)) +
+  geom_pointrange(fatten = 1/2, aes(colour=below_zero)) +
+  geom_hline(yintercept = b0, colour = "red") +
+  geom_hline(aes(yintercept = b3), colour = "blue") + # this would add a line at b1 - the target effect size
+  scale_colour_manual(values=c("darkgrey","black")) +
+  geom_text(aes(x=4, y=0.025,
+                label = sprintf("%.f%s", power, "% power")), color = "darkgrey", size = 4) +
+  theme_bw() +
+  theme(legend.position = "none") +
+  labs(x = "sim # (i.e., simulation index)",
+       y = expression(beta[3])) +
+  facet_wrap(~subj_n)
+p_params
+
+ggsave ("figures/parameters.jpeg")
+```
+
+
+
+## let's now consider widths and precision, rather than NHST and power ##
+
+## load in the saved parameters if necessary ##
+
+This has 1000 sims per 3 Ns and 3 b1s. What's nice about this approach is that without sweating blood to think about what widths
+to come up with, we can just simulate a range of reasonable/feasible sample sizes and effect sizes. We already know a lot about
+both of these, given the practical and financial constraints of the type of data collections and effect sizes in psychology,
+which tend to be small. So it might be a good way to go initially to get a sense.
+
+ok, so let's look at widths when we have N=500 or N=600.
+
+```{r}
+sim_p <- read_csv("data/sim_p.csv") %>% 
+  filter(parameter == "agentd") 
+head(sim_p)
+
+# if sim_p is already loaded then use this code
+# sim_p <- sim_p %>% 
+#   filter(parameter == "agentd") 
+# head(sim_p)
+```
+
+## we might evaluate "power" by widths ##
+
+Instead of just ordering the point-ranges by their seed values, we might instead arrange them by the lower levels.
+
+```{r}
+# wrangle to order by Q2.5
+plot_p <- sim_p %>%
+  arrange(subj_n, Q2.5) %>%
+  mutate(rank = rep(1:5, times=2)) %>% # 5 models per variation (2 Ns so far)
+  mutate(subj_n = factor(subj_n))
+head(plot_p)
+str(plot_p)
+
+# plot
+p_params <- plot_p %>%
+  ggplot(aes(x = rank, y = Estimate, ymin = Q2.5, ymax = Q97.5)) +
+  geom_pointrange(fatten = 1/2) +
+  geom_hline(aes(yintercept = b0), colour = "red") +
+  theme_bw() +
+  theme(legend.position = "none") +
+  scale_x_discrete("reordered by the lower level of the 95% intervals", breaks = NULL) +
+  ylab(expression(beta[3])) +
+  facet_wrap(~subj_n)
+p_params
+
+ggsave("figures/params_by_Q2.5.jpeg")
+```
+
+Notice how this arrangement highlights the differences in widths among the intervals. The wider the interval, the less precise the estimate. Some intervals were wider than others, but all tended to hover in a similar range. We might quantify those ranges by computing a width variable.
+
+```{r}
+plot_p <-
+  plot_p %>% 
+  mutate(width = Q97.5 - Q2.5)
+
+head(plot_p)
+```
+
+Here’s the width distribution.
+
+```{r}
+p_hist <- plot_p %>% 
+  ggplot(aes(x = width, fill = subj_n, colour = subj_n)) +
+  geom_histogram(binwidth = .01) +
+  geom_rug(linewidth = 1/6) +
+  theme_bw() +
+  facet_wrap(~subj_n)
+p_hist
+
+ggsave("figures/width_hist.jpeg")
+
+p_hist_2 <- plot_p %>%
+  ggplot(aes(x = width, fill = subj_n, colour = subj_n)) +
+  geom_histogram(binwidth = .01, position = 'identity', alpha = 0.7) +
+  geom_rug(linewidth = 1/6) +
+  scale_fill_discrete(breaks=c('500', '600')) +
+  scale_colour_discrete(breaks="none") +
+  theme_bw() +
+  theme(legend.position = "right") + 
+  # scale_x_continuous(breaks = seq(0.1, 0.3, 0.1), limits = c(0.1, 0.3)) +
+  ggtitle("95% interval widths by simulated sample size")
+p_hist_2
+
+ggsave("figures/width_hist_2.jpeg")
+```
+
+The widths of our 95% intervals range from 0.16 to ~0.20 across the variation in sample size. 
+Let’s focus a bit and take a random sample from a few of the simulation iterations.
+
+So far, N=250 per group looks good, in short. Avg width about 0.19, biggest widths about 0.2.
+
+
+Take a random sample to look at a few...
+
+```{r}
+set.seed(1)
+
+plot_p %>%
+  group_by(subj_n) %>% 
+  sample_n(1) %>% 
+  # mutate(rep = rep %>% as.character()) %>%
+
+  ggplot(aes(x = Estimate, xmin = Q2.5, xmax = Q97.5, y = subj_n,
+             colour = subj_n)) +
+  geom_vline(xintercept = c(0, .5), color = "white") +
+  geom_pointrange() +
+  labs(x = expression(beta[3]),
+       y = "subj #") +
+  scale_y_discrete(breaks = c(500, 600)) +
+  scale_x_continuous(breaks = seq(-0.4, 0.4, 0.2), limits = c(-0.4, 0.4)) 
+```
+
+So, instead of focusing on rejecting a null hypothesis, we might instead use our simulation skills to determine the sample size we need to have most of our 95% intervals come in at a certain level of precision. This has been termed the accuracy in parameter estimation [AIPE; Maxwell et al. ( 2008); see also Kruschke ( 2015)] approach to sample size planning.
+
+Thinking in terms of AIPE, in terms of precision, let’s say we wanted widths of 0.3, 0.2, 0.1 or smaller. Here’s how we did with our sims.
+
+```{r}
+plot_p %>%
+  group_by(subj_n) %>% 
+  mutate(below_03 = if_else(width < .3, 1, 0),
+         below_02 = if_else(width < .2, 1, 0),
+         below_01 = if_else(width < .1, 1, 0)) %>% 
+  summarise(power_03 = mean(below_03),
+            power_02 = mean(below_02),
+            power_01 = mean(below_01))
+
+# subj_n power_03 power_02 power_01
+#   <fct>     <dbl>    <dbl>    <dbl>
+# 1 500           1        1        0
+# 2 600           1        1        0
+```
+
+ok, at N=250 (or higher), widths < .3 and .2 look good. .1 looks terrible.
+
+Our simulation suggests we have about a high probability of achieving 95% CI widths of 0.2 or smaller with n=250 or higher.
+
+That last bit about excluding zero brings up an important point. Once we’re concerned about width size, about precision, the null hypothesis is no longer of direct relevance. And since we’re no longer wed to thinking in terms of the null hypothesis, there’s no real need to stick with a .8 threshold for evaluating width power (okay, I’ll stop using that term). Now if we wanted to stick with .8, we could. Though a little nonsensical, the .8 criterion would give our AIPE analyses a sense of familiarity with traditional power analyses, which some reviewers might appreciate. But in his text, Kruschke mentioned several other alternatives. One would be to set maximum value for our CI widths and simulate to find the nn necessary so all our simulations pass that criterion. Another would follow Joseph, Wolfson, and du Berger ( 1995, 1995), who suggested we shoot for an N that produces widths that pass that criterion on average. Here’s how we did based on the average-width criterion.
+
+```{r}
+plot_p %>%
+  group_by(subj_n) %>%
+  summarise(avg_width = mean(width))
+
+# subj_n avg_width
+#   <fct>      <dbl>
+# 1 500        0.193
+# 2 600        0.169
+```
+
+ok, so the average for 500 and 600 are pretty good? Below 0.2.
+That would mean that an effect of 0.2 could be distinguished consistently from 
+zero and nearly from 0.1...
+
+And if the effect is larger, then we would equally be more confident about distinguishing it
+from other effect sizes e.g.,
+
+0.4 - we would be fairly confident that 0.3 and 0.5 are unlikely, across to our 95% interval.
+
+So fairly precise?
+
+
