@@ -433,26 +433,32 @@ write_csv(parameters, "data/sim_p.csv")
 
 ## 7) calculate power i.e., % Q2.5 > 0 ##
 
+we have nothing to group_by, if we only have 1 set of sims.
+
 ```{r}
 power <- parameters %>% 
   filter(parameter == "agentd") %>%
-  group_by(subj_n) %>% 
+  # group_by(subj_n) %>% 
   mutate(check = ifelse(Q2.5 > 0, 1, 0)) %>% 
   summarise(power = mean(check)) %>% 
-  mutate(subj_n = factor(subj_n))
+  mutate(subj_n = factor(subj_n)) # this helps to plot and join later.
 power
 ```
 
 plot power
 
-```{r}
-p_power <- ggplot(power, aes(x = subj_n, y = power, fill = power)) +
-  geom_tile() +
-  geom_text(aes(label = sprintf("%.2f", power)), color = "white", size = 10) +
-  scale_fill_viridis_c(limits = c(0, 1)) 
-p_power
+(this plot is only really adding any value if we vary the sims by sample size or 
+effect size or some other variable. If not, we just have a single number, so ignore
+this plot here).
 
-ggsave ("figures/power.jpeg")
+```{r}
+# p_power <- ggplot(power, aes(x = subj_n, y = power, fill = power)) +
+#   geom_tile() +
+#   geom_text(aes(label = sprintf("%.2f", power)), color = "white", size = 10) +
+#   scale_fill_viridis_c(limits = c(0, 1))
+# p_power
+# 
+# ggsave ("figures/power.jpeg")
 ```
 
 plot parameters and include power as a text label
@@ -466,8 +472,7 @@ plot_params <- parameters %>%
          below_zero = factor(below_zero, levels = c("no", "yes")),
          subj_n = factor(subj_n)) %>% 
   inner_join(power, by = c("subj_n")) %>% 
-  mutate(power = round(power * 100, 0)) 
-  # mutate(power = if_else(power == 100, 99, power)) # avoid power = 100% when it isn't due to rounding
+  mutate(power = round(power * 100, 2)) 
 head(plot_params)
 ```
 
@@ -482,8 +487,8 @@ p_params <- plot_params %>%
   geom_hline(yintercept = b0, colour = "red") +
   geom_hline(aes(yintercept = b3), colour = "blue") + # this would add a line at b1 - the target effect size
   scale_colour_manual(values=c("darkgrey","black")) +
-  geom_text(aes(x=1.5, y=-0.1,
-                label = sprintf("%.f%s", power, "% power")), color = "darkgrey", size = 4) +
+  geom_text(aes(x=900, y=-0.05,
+                label = sprintf("%.1f%s", power, "% power")), color = "darkgrey", size = 4) +
   theme_bw() +
   theme(legend.position = "none") +
   labs(x = "sim # (i.e., simulation index)",
