@@ -53,7 +53,8 @@ This file is a streamlined version, which only keeps the key aspects.
 ## load ##
 
 ```{r load-pkg}
-pkg <- c("cmdstanr", "brms", "tidyverse", "future", "parallel", "faux", "standist")
+pkg <- c("cmdstanr", "brms", "tidyverse", "future", "parallel", "faux", 
+         "standist", "tidybayes")
 
 lapply(pkg, library, character.only = TRUE)
 ```
@@ -80,7 +81,7 @@ detectCores()
 
 ## 1) create some initial data ##
 
-As part of the sims_testng.Rmd file, we first fit a model to prior data from a past experiment, which
+As part of the sims_testing.Rmd file, we first fit a model to prior data from a past experiment, which
 had a similar structure and design so that it could help us guide our choices of SDs and cor values 
 below when creating the data.
 
@@ -430,15 +431,79 @@ save out parameters
 write_csv(parameters, "data/sim_p.csv")
 ```
 
+alternatively, read in saved parameters, if already computed and saved.
+
+```{r}
+parameters <- read_csv("data/sim_p.csv") 
+head(parameters)
+```
+
+maybe plot a quick summary using tidybayes, just to see what the distributions
+look like (e.g., do they hit the simulated target values, on average, as they 
+should?)
+
+let's first calculate some summaries
+
+```{r}
+# all fixed effects
+param_qi <- parameters %>%
+  group_by(parameter) %>% 
+  median_qi(Estimate)
+head(param_qi)
+
+write_csv(param_qi, "data/param_qi.csv")
+```
+
+ok, so the intervals cover the right values per parameter, which is re-assuring.
+Interesting that the avg for agent is 0.167 when the target was 0.2. Over 1000 sims
+you wouldn't think the point estimate would be off by that much, but of course, 
+the intervals seem fine. Something to think about / check though.
+
+and now let's plot
+
+first, wrangle to make factors
+
+```{r}
+tidy_params <- parameters %>% 
+  mutate(parameter = factor(parameter, levels = c("Intercept", "agentd",
+                                                  "mat2v1", "mat3v1")))
+head(tidy_params)
+```
+
+and plot
+
+```{r}
+p_fixed <- ggplot(tidy_params, aes(x = Estimate, y = fct_rev(parameter), 
+                                   fill=parameter)) +  
+  geom_vline(xintercept = 0, color = "grey", alpha = 5/10) +
+  stat_halfeye() +
+  labs(title = "Avg. simulated coefficient plot for fixed effects (predictors)",
+       x = NULL, y = NULL) +
+  theme_bw() +
+  scale_fill_brewer(palette = "Dark2") +
+  theme(panel.grid   = element_blank(),
+        panel.grid.major.y = element_line(color = alpha("firebrick4", 1/2), linetype = 3),
+        axis.text.y  = element_text(hjust = 0),
+        axis.ticks.y = element_blank(),
+        legend.position = "none") +
+  coord_cartesian(xlim =c(-0.4, 0.4)) +
+  scale_x_continuous(breaks=seq(-0.4,0.4,0.2))
+p_fixed
+
+ggsave ("figures/fixef.jpeg",
+        width = 5, height = 4)
+```
 
 ## 7) calculate power i.e., % Q2.5 > 0 ##
 
-we have nothing to group_by, if we only have 1 set of sims.
+note: we have nothing to group_by(), if we only have 1 set of sims. i.e.,
+1 set of variables to simulate. But we do it anyway, just to make the join easier
+in the code below.
 
 ```{r}
 power <- parameters %>% 
   filter(parameter == "agentd") %>%
-  # group_by(subj_n) %>% 
+  group_by(subj_n) %>% # here we would group_by stuff that we varied in the sims
   mutate(check = ifelse(Q2.5 > 0, 1, 0)) %>% 
   summarise(power = mean(check)) %>% 
   mutate(subj_n = factor(subj_n)) # this helps to plot and join later.
@@ -452,11 +517,11 @@ effect size or some other variable. If not, we just have a single number, so ign
 this plot here).
 
 ```{r}
-# p_power <- ggplot(power, aes(x = subj_n, y = power, fill = power)) +
-#   geom_tile() +
-#   geom_text(aes(label = sprintf("%.2f", power)), color = "white", size = 10) +
-#   scale_fill_viridis_c(limits = c(0, 1))
-# p_power
+p_power <- ggplot(power, aes(x = subj_n, y = power, fill = power)) +
+  geom_tile() +
+  geom_text(aes(label = sprintf("%.3f", power)), color = "white", size = 10) +
+  scale_fill_viridis_c(limits = c(0, 1)) 
+p_power
 # 
 # ggsave ("figures/power.jpeg")
 ```
@@ -484,7 +549,7 @@ the one that works so far (but with only 2 hlines and b1 is fixed at 0.5, which 
 p_params <- plot_params %>%
   ggplot(aes(x = rep, y = Estimate, ymin = Q2.5, ymax = Q97.5)) +
   geom_pointrange(fatten = 1/2, aes(colour=below_zero)) +
-  geom_hline(yintercept = b0, colour = "red") +
+  geom_hline(yintercept = 0, colour = "red") +
   geom_hline(aes(yintercept = b3), colour = "blue") + # this would add a line at b1 - the target effect size
   scale_colour_manual(values=c("darkgrey","black")) +
   geom_text(aes(x=900, y=-0.05,
@@ -492,41 +557,35 @@ p_params <- plot_params %>%
   theme_bw() +
   theme(legend.position = "none") +
   labs(x = "sim # (i.e., simulation index)",
-       y = expression(beta[3])) 
+       y = expression(beta[3](agent))) 
 p_params
 
-ggsave ("figures/parameters.jpeg")
+ggsave ("figures/parameters.jpeg",
+        width = 5, height = 4)
 ```
-
 
 
 ## 8) let's now consider widths and precision, rather than NHST and power ##
 
 ## load in the saved parameters if necessary ##
 
-This has 1000 sims. What's nice about this approach is that without sweating blood to think about what widths
-to come up with, we can just simulate a range of reasonable/feasible sample sizes and effect sizes. We already know a lot about
-both of these, given the practical and financial constraints of the type of data collections and effect sizes in psychology,
-which tend to be small. So it might be a good way to go initially to get a sense.
+This has 1000 sims. What's nice about this approach is that without sweating blood to think about what kind of widths to come up with, we can just simulate a range of reasonable/feasible sample sizes and effect sizes. We already know a lot about
+both of these, given the practical and financial constraints of the type of data collections and effect sizes in psychology, which tend to be small. So it might be a good way to go initially to get a sense.
 
-ok, so let's look at widths when we have N=500. We ended up only simulating one sample size. N=500. Let's see what that gives us.
+ok, so let's look at widths when we have N=500. We ended up only simulating one sample size. Let's see what that gives us.
 
 ```{r}
-sim_p <- read_csv("data/sim_p.csv") %>% 
-  filter(parameter == "agentd") 
-head(sim_p)
-
-# if sim_p is already loaded then use this code
-# sim_p <- sim_p %>% 
-#   filter(parameter == "agentd") 
-# head(sim_p)
+# if the parameters df is not already loaded
+parameters <- read_csv("data/sim_p.csv") 
+head(parameters)
 ```
 
 Instead of just ordering the point-ranges by their seed values, we might instead arrange them by the lower levels.
 
 ```{r}
 # wrangle to order by Q2.5
-plot_p <- sim_p %>%
+plot_p <- parameters %>%
+  filter(parameter == "agentd") %>% 
   arrange(subj_n, Q2.5) %>%
   mutate(rank = 1:1000) %>% # 1000 models per variation (1 N so far i.e., 500)
   mutate(subj_n = factor(subj_n))
@@ -537,15 +596,16 @@ str(plot_p)
 p_params <- plot_p %>%
   ggplot(aes(x = rank, y = Estimate, ymin = Q2.5, ymax = Q97.5)) +
   geom_pointrange(fatten = 1/2) +
-  geom_hline(aes(yintercept = b0), colour = "red") +
+  geom_hline(aes(yintercept = 0), colour = "red") +
   theme_bw() +
   theme(legend.position = "none") +
   scale_x_discrete("reordered by the lower level of the 95% intervals", breaks = NULL) +
-  ylab(expression(beta[3])) +
-  facet_wrap(~subj_n)
+  ylab(expression(beta[3])) 
+  # facet_wrap(~subj_n)
 p_params
 
-ggsave("figures/params_by_Q2.5.jpeg")
+ggsave("figures/params_by_Q2.5.jpeg",
+       width = 5, height = 4)
 ```
 
 Notice how this arrangement highlights the differences in widths among the intervals. The wider the interval, the less precise the estimate. Some intervals were wider than others, but all tended to hover in a similar range. We might quantify those ranges by computing a width variable.
@@ -562,54 +622,45 @@ Here’s the width distribution.
 
 ```{r}
 p_hist <- plot_p %>% 
-  ggplot(aes(x = width, fill = subj_n, colour = subj_n)) +
-  geom_histogram(binwidth = .01) +
+  ggplot(aes(x = width, fill = "", colour = "")) +
+  geom_histogram(binwidth = .001) +
   geom_rug(linewidth = 1/6) +
+  scale_fill_brewer(palette = "Dark2") +
+  scale_colour_brewer(palette = "Dark2") +
   theme_bw() +
-  facet_wrap(~subj_n)
+  theme(legend.position = "none") 
 p_hist
 
-ggsave("figures/width_hist.jpeg")
-
-p_hist_2 <- plot_p %>%
-  ggplot(aes(x = width, fill = subj_n, colour = subj_n)) +
-  geom_histogram(binwidth = .01, position = 'identity', alpha = 0.7) +
-  geom_rug(linewidth = 1/6) +
-  scale_fill_discrete(breaks=c('500', '600')) +
-  scale_colour_discrete(breaks="none") +
-  theme_bw() +
-  theme(legend.position = "right") + 
-  # scale_x_continuous(breaks = seq(0.1, 0.3, 0.1), limits = c(0.1, 0.3)) +
-  ggtitle("95% interval widths by simulated sample size")
-p_hist_2
-
-ggsave("figures/width_hist_2.jpeg")
+ggsave("figures/width_hist.jpeg",
+       width = 5, height = 4)
 ```
 
-The widths of our 95% intervals range from 0.16 to ~0.20 across the variation in sample size. 
+The widths of our 95% intervals range from 0.14 to 0.17. So far, N=250 per group 
+looks good. Avg. width is about 0.155, biggest widths about 0.17.
+
 Let’s focus a bit and take a random sample from a few of the simulation iterations.
-
-So far, N=250 per group looks good, in short. Avg width about 0.19, biggest widths about 0.2.
-
 
 Take a random sample to look at a few...
 
 ```{r}
 set.seed(1)
 
-plot_p %>%
+sample10 <- plot_p %>%
   group_by(subj_n) %>% 
-  sample_n(1) %>% 
-  # mutate(rep = rep %>% as.character()) %>%
+  sample_n(10) %>% 
+  mutate(rep = rep %>% as.character()) %>%
 
-  ggplot(aes(x = Estimate, xmin = Q2.5, xmax = Q97.5, y = subj_n,
+  ggplot(aes(x = Estimate, xmin = Q2.5, xmax = Q97.5, y = rep,
              colour = subj_n)) +
-  geom_vline(xintercept = c(0, .5), color = "white") +
+  geom_vline(xintercept = c(0, .4), color = "white") +
   geom_pointrange() +
   labs(x = expression(beta[3]),
-       y = "subj #") +
-  scale_y_discrete(breaks = c(500, 600)) +
-  scale_x_continuous(breaks = seq(-0.4, 0.4, 0.2), limits = c(-0.4, 0.4)) 
+       y = "rep #") +
+  scale_x_continuous(breaks = seq(0, 0.4, 0.1), limits = c(0, 0.4))
+sample10
+
+ggsave("figures/sample10.jpeg",
+       width = 5, height = 4)
 ```
 
 So, instead of focusing on rejecting a null hypothesis, we might instead use our simulation skills to determine the sample size we need to have most of our 95% intervals come in at a certain level of precision. This has been termed the accuracy in parameter estimation [AIPE; Maxwell et al. ( 2008); see also Kruschke ( 2015)] approach to sample size planning.
@@ -617,7 +668,7 @@ So, instead of focusing on rejecting a null hypothesis, we might instead use our
 Thinking in terms of AIPE, in terms of precision, let’s say we wanted widths of 0.3, 0.2, 0.1 or smaller. Here’s how we did with our sims.
 
 ```{r}
-plot_p %>%
+precision <- plot_p %>%
   group_by(subj_n) %>% 
   mutate(below_03 = if_else(width < .3, 1, 0),
          below_02 = if_else(width < .2, 1, 0),
@@ -625,39 +676,44 @@ plot_p %>%
   summarise(power_03 = mean(below_03),
             power_02 = mean(below_02),
             power_01 = mean(below_01))
+precision
+
+write_csv(precision, "data/precision.csv")
 
 # subj_n power_03 power_02 power_01
 #   <fct>     <dbl>    <dbl>    <dbl>
 # 1 500           1        1        0
-# 2 600           1        1        0
 ```
 
-ok, at N=250 (or higher), widths < .3 and .2 look good. .1 looks terrible.
+ok, at N=250 per group (or higher), widths < .3 and .2 look good. .1 looks terrible.
 
-Our simulation suggests we have about a high probability of achieving 95% CI widths of 0.2 or smaller with n=250 or higher.
+Our simulation suggests we have about a high probability of achieving 95% CI 
+widths of 0.2 or smaller with n=250 or higher.
 
-That last bit about excluding zero brings up an important point. Once we’re concerned about width size, about precision, the null hypothesis is no longer of direct relevance. And since we’re no longer wed to thinking in terms of the null hypothesis, there’s no real need to stick with a .8 threshold for evaluating width power (okay, I’ll stop using that term). Now if we wanted to stick with .8, we could. Though a little nonsensical, the .8 criterion would give our AIPE analyses a sense of familiarity with traditional power analyses, which some reviewers might appreciate. But in his text, Kruschke mentioned several other alternatives. One would be to set maximum value for our CI widths and simulate to find the nn necessary so all our simulations pass that criterion. Another would follow Joseph, Wolfson, and du Berger ( 1995, 1995), who suggested we shoot for an N that produces widths that pass that criterion on average. Here’s how we did based on the average-width criterion.
+>That last bit about excluding zero brings up an important point. Once we’re concerned about width size, about precision, the null hypothesis is no longer of direct relevance. And since we’re no longer wed to thinking in terms of the null hypothesis, there’s no real need to stick with a .8 threshold for evaluating width power (okay, I’ll stop using that term). Now if we wanted to stick with .8, we could. Though a little nonsensical, the .8 criterion would give our AIPE analyses a sense of familiarity with traditional power analyses, which some reviewers might appreciate. But in his text, Kruschke mentioned several other alternatives. One would be to set maximum value for our CI widths and simulate to find the nn necessary so all our simulations pass that criterion. Another would follow Joseph, Wolfson, and du Berger ( 1995, 1995), who suggested we shoot for an N that produces widths that pass that criterion on average. Here’s how we did based on the average-width criterion.
 
 ```{r}
-plot_p %>%
+avg_width <- plot_p %>%
   group_by(subj_n) %>%
   summarise(avg_width = mean(width))
+avg_width
+
+write_csv(avg_width, "data/avg_width.csv")
 
 # subj_n avg_width
 #   <fct>      <dbl>
-# 1 500        0.193
-# 2 600        0.169
+# 1 500        0.154
 ```
 
-ok, so the average for 500 and 600 are pretty good? Below 0.2.
+ok, so the average for N=500 is pretty good. Between .1 and .2 - .154 on avg.
 That would mean that an effect of 0.2 could be distinguished consistently from 
-zero and nearly from 0.1...
+zero and quite often from 0.1...
 
-And if the effect is larger, then we would equally be more confident about distinguishing it
-from other effect sizes e.g.,
+And if the effect is larger, then we would equally be more confident about 
+distinguishing it from other effect sizes e.g.,
 
-0.4 - we would be fairly confident that 0.3 and 0.5 are unlikely, across to our 95% interval.
+0.4 - we would be fairly confident that 0.3 and 0.5 are unlikely, on average.
 
-So fairly precise?
+So fairly precise? At least for work in psychology.
 
 
