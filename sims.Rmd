@@ -604,8 +604,8 @@ p_params <- plot_p %>%
   # facet_wrap(~subj_n)
 p_params
 
-ggsave("figures/params_by_Q2.5.jpeg",
-       width = 5, height = 4)
+# ggsave("figures/params_by_Q2.5.jpeg",
+#        width = 5, height = 4)
 ```
 
 Notice how this arrangement highlights the differences in widths among the intervals. The wider the interval, the less precise the estimate. Some intervals were wider than others, but all tended to hover in a similar range. We might quantify those ranges by computing a width variable.
@@ -659,8 +659,8 @@ sample10 <- plot_p %>%
   scale_x_continuous(breaks = seq(0, 0.4, 0.1), limits = c(0, 0.4))
 sample10
 
-ggsave("figures/sample10.jpeg",
-       width = 5, height = 4)
+# ggsave("figures/sample10.jpeg",
+#        width = 5, height = 4)
 ```
 
 So, instead of focusing on rejecting a null hypothesis, we might instead use our simulation skills to determine the sample size we need to have most of our 95% intervals come in at a certain level of precision. This has been termed the accuracy in parameter estimation [AIPE; Maxwell et al. ( 2008); see also Kruschke ( 2015)] approach to sample size planning.
