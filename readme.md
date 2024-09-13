@@ -1,4 +1,4 @@
-This files runs simulations for the AI minimal group experiment.
+This files runs simulations for the AI minimal group experiment with Eliane, Mike and Ofir.
 
 The basic structure and code follows the examples outlined by Solomon Kurz in his
 'power' blogs and Lisa Debruine's 'faux' package. 
@@ -32,7 +32,7 @@ See this link for the difference between cloning and forking. https://github.com
 
 **sims.Rmd**
 
-This file runs the simulations and saves figures and data in the folowing folders.
+This file runs the simulations and saves figures and data in the following folders.
 
 **/figures/**
 **/data/**
